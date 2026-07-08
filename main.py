@@ -1,26 +1,24 @@
 import time
 import uuid
+from typing import List
 
 import jwt
-from fastapi import FastAPI, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Q1 VALUES
 # ---------------------------------------------------------------------------
-EMAIL = "24f3003125@ds.study.iitm.ac.in"          # <-- your exact logged-in email
-ALLOWED_ORIGIN = "https://dash-dw26jb.example.com"  # <-- your assigned origin
+EMAIL = "24f3003125@ds.study.iitm.ac.in"            # your exact logged-in email
+ALLOWED_ORIGIN = "https://dash-dw26jb.example.com"  # your assigned origin (Q1)
 
 # ---------------------------------------------------------------------------
-# Q2 VALUES  --  COPY THESE DIRECTLY FROM THE ASSIGNMENT PAGE (avoid typos!)
+# Q2 VALUES  --  COPY DIRECTLY FROM THE ASSIGNMENT PAGE
 # ---------------------------------------------------------------------------
 ISSUER = "https://idp.exam.local"
 AUDIENCE = "tds-3hypqblt.apps.exam.local"
 
-# Paste the RS256 public key EXACTLY as shown on the page (copy from portal,
-# do not retype). Even one wrong character breaks signature verification.
 PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
 cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
@@ -30,26 +28,65 @@ ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
 SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
 dQIDAQAB
 -----END PUBLIC KEY-----"""
+
+# ---------------------------------------------------------------------------
+# Q3 CONFIG LAYERS (low -> high precedence)
+# ---------------------------------------------------------------------------
+DEFAULTS = {                       # layer 1: hardcoded defaults (already typed)
+    "port": 8000,
+    "workers": 1,
+    "debug": False,
+    "log_level": "info",
+    "api_key": "default-secret-000",
+}
+YAML_LAYER = {"workers": 16}       # layer 2: config.development.yaml
+ENV_FILE = {"NUM_WORKERS": "11"}   # layer 3: .env  (NUM_WORKERS is an alias)
+OS_ENV = {                         # layer 4: OS env vars (APP_* prefix)
+    "APP_PORT": "8904",
+    "APP_LOG_LEVEL": "warning",
+}
+ALIAS = {"NUM_WORKERS": "workers"}  # .env alias mapping
 # ---------------------------------------------------------------------------
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+
+def _acao_for(path: str, origin):
+    """Which Access-Control-Allow-Origin to send for a given path."""
+    if origin is None:
+        return None
+    if path.startswith("/stats"):
+        # Q1: strict -- only the assigned origin, no wildcard
+        return origin if origin == ALLOWED_ORIGIN else None
+    # Q3 (/effective-config) and everything else: reflect any origin
+    return origin
 
 
 @app.middleware("http")
-async def add_required_headers(request: Request, call_next):
+async def cors_and_headers(request: Request, call_next):
+    origin = request.headers.get("origin")
+    path = request.url.path
     start = time.perf_counter()
-    response = await call_next(request)
+
+    if request.method == "OPTIONS":
+        # CORS preflight -- answer here
+        resp = Response(status_code=204)
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            request.headers.get("access-control-request-headers") or "*"
+        )
+    else:
+        resp = await call_next(request)
+
+    acao = _acao_for(path, origin)
+    if acao:
+        resp.headers["Access-Control-Allow-Origin"] = acao
+    resp.headers["Vary"] = "Origin"
+
     elapsed = time.perf_counter() - start
-    response.headers["X-Request-ID"] = str(uuid.uuid4())
-    response.headers["X-Process-Time"] = f"{elapsed:.6f}"
-    return response
+    resp.headers["X-Request-ID"] = str(uuid.uuid4())
+    resp.headers["X-Process-Time"] = f"{elapsed:.6f}"
+    return resp
 
 
 # --------------------------- Q1: /stats ------------------------------------
@@ -77,10 +114,9 @@ async def verify(body: TokenIn):
         claims = jwt.decode(
             body.token,
             PUBLIC_KEY,
-            algorithms=["RS256"],   # only RS256; blocks "alg: none" tricks
-            audience=AUDIENCE,      # rejects wrong-audience tokens
-            issuer=ISSUER,          # rejects wrong-issuer tokens
-            # exp is verified by default (rejects expired tokens)
+            algorithms=["RS256"],
+            audience=AUDIENCE,
+            issuer=ISSUER,
         )
         return {
             "valid": True,
@@ -89,5 +125,49 @@ async def verify(body: TokenIn):
             "aud": claims.get("aud"),
         }
     except jwt.PyJWTError:
-        # bad signature / tampered / expired / wrong aud / wrong iss -> 401
         return JSONResponse(status_code=401, content={"valid": False})
+
+
+# --------------------------- Q3: /effective-config -------------------------
+def _coerce(key, value):
+    if key in ("port", "workers"):
+        return int(value)
+    if key == "debug":
+        return str(value).strip().lower() in ("true", "1", "yes", "on")
+    return str(value)
+
+
+@app.get("/effective-config")
+async def effective_config(overrides: List[str] = Query(default=[], alias="set")):
+    merged = {}
+
+    # layer 1: defaults
+    merged.update(DEFAULTS)
+
+    # layer 2: yaml
+    for k, v in YAML_LAYER.items():
+        merged[k] = v
+
+    # layer 3: .env (apply alias)
+    for k, v in ENV_FILE.items():
+        merged[ALIAS.get(k, k)] = v
+
+    # layer 4: OS env vars with APP_ prefix
+    for k, v in OS_ENV.items():
+        if k.startswith("APP_"):
+            merged[k[4:].lower()] = v
+
+    # highest precedence: CLI overrides ?set=key=value
+    for item in overrides:
+        if "=" in item:
+            k, v = item.split("=", 1)
+            merged[k.strip()] = v
+
+    # coerce types
+    result = {k: _coerce(k, v) for k, v in merged.items()}
+
+    # secret masking -- api_key never exposed
+    if "api_key" in result:
+        result["api_key"] = "****"
+
+    return result

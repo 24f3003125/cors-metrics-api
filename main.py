@@ -171,3 +171,39 @@ async def effective_config(overrides: List[str] = Query(default=[], alias="set")
         result["api_key"] = "****"
 
     return result
+
+
+# --------------------------- Q5: /analytics --------------------------------
+API_KEY = "ak_jq620l7dz0acj29gan0uwbki"   # your assigned X-API-Key value
+
+
+@app.post("/analytics")
+async def analytics(request: Request):
+    # Auth: X-API-Key header must match, else 401
+    if request.headers.get("x-api-key") != API_KEY:
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+    payload = await request.json()
+    events = payload.get("events", [])
+
+    total_events = len(events)
+    unique_users = len({e.get("user") for e in events})
+
+    revenue = 0.0
+    totals = {}
+    for e in events:
+        amt = e.get("amount", 0)
+        if amt > 0:
+            revenue += amt
+            user = e.get("user")
+            totals[user] = totals.get(user, 0) + amt
+
+    top_user = max(totals, key=totals.get) if totals else None
+
+    return {
+        "email": EMAIL,
+        "total_events": total_events,
+        "unique_users": unique_users,
+        "revenue": revenue,
+        "top_user": top_user,
+    }

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ---------------------------------------------------------------------------
 # CHANGE THESE TWO VALUES
 # ---------------------------------------------------------------------------
-EMAIL = "21f1234567@ds.study.iitm.ac.in"   # <-- your exact logged-in email
+EMAIL = "24f3003125@ds.study.iitm.ac.in"   # <-- your exact logged-in email
 ALLOWED_ORIGIN = "https://dash-dw26jb.example.com"    # <-- your assigned origin
 # ---------------------------------------------------------------------------
 

@@ -68,6 +68,13 @@ IDEMPOTENT = {}                   # Idempotency-Key -> order
 RATE = {}                         # client_id -> deque[timestamps]
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Q10 MIDDLEWARE-STACK STATE
+# ---------------------------------------------------------------------------
+B_PING = 11                       # /ping bucket size per 10s
+RATE_PING = {}                    # client_id -> deque[timestamps] for /ping
+# ---------------------------------------------------------------------------
+
 app = FastAPI()
 
 
@@ -87,7 +94,9 @@ async def cors_and_headers(request: Request, call_next):
     global REQUEST_COUNT
     origin = request.headers.get("origin")
     path = request.url.path
-    request_id = str(uuid.uuid4())
+    # Q10 request context: reuse inbound X-Request-ID, else fresh UUID4
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = request_id
     start = time.perf_counter()
 
     # Q6: count every request to any endpoint (live counter)
@@ -108,16 +117,23 @@ async def cors_and_headers(request: Request, call_next):
             request.headers.get("access-control-request-headers") or "*"
         )
     else:
-        # Q9: per-client rate limit on /orders (only when X-Client-Id present)
+        # per-client rate limit (only when X-Client-Id present)
+        #   /orders -> R=15 (Q9),  /ping -> B=11 (Q10)
         limited = None
+        rule = None
         if path.startswith("/orders"):
+            rule = (RATE_LIMIT, RATE)
+        elif path.startswith("/ping"):
+            rule = (B_PING, RATE_PING)
+        if rule:
+            cap, store = rule
             cid = request.headers.get("x-client-id")
             if cid:
                 now = time.time()
-                dq = RATE.setdefault(cid, deque())
+                dq = store.setdefault(cid, deque())
                 while dq and now - dq[0] >= RATE_WINDOW:
                     dq.popleft()
-                if len(dq) >= RATE_LIMIT:
+                if len(dq) >= cap:
                     retry = max(1, int(RATE_WINDOW - (now - dq[0])) + 1)
                     limited = JSONResponse(
                         status_code=429, content={"detail": "rate limit exceeded"}
@@ -322,3 +338,9 @@ async def list_orders(limit: int = Query(10), cursor: str = Query("")):
     items = [{"id": i} for i in range(start, end + 1)]
     next_cursor = str(end + 1) if end < T_ORDERS else None
     return {"items": items, "next_cursor": next_cursor}
+
+
+# --------------------------- Q10: /ping ------------------------------------
+@app.get("/ping")
+async def ping(request: Request):
+    return {"email": EMAIL, "request_id": request.state.request_id}

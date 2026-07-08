@@ -131,6 +131,10 @@ async def cors_and_headers(request: Request, call_next):
     if acao:
         resp.headers["Access-Control-Allow-Origin"] = acao
     resp.headers["Vary"] = "Origin"
+    # let cross-origin JS actually read these response headers
+    resp.headers["Access-Control-Expose-Headers"] = (
+        "Retry-After, X-Request-ID, X-Process-Time"
+    )
 
     elapsed = time.perf_counter() - start
     resp.headers["X-Request-ID"] = request_id

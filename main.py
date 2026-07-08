@@ -1,10 +1,12 @@
 import time
 import uuid
+from collections import deque
+from datetime import datetime, timezone
 from typing import List
 
 import jwt
 from fastapi import FastAPI, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -48,6 +50,14 @@ OS_ENV = {                         # layer 4: OS env vars (APP_* prefix)
 ALIAS = {"NUM_WORKERS": "workers"}  # .env alias mapping
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Q6 OBSERVABILITY STATE
+# ---------------------------------------------------------------------------
+START_TIME = time.time()          # for uptime_s
+REQUEST_COUNT = 0                 # live Prometheus counter
+LOGS = deque(maxlen=500)          # in-memory structured log buffer
+# ---------------------------------------------------------------------------
+
 app = FastAPI()
 
 
@@ -64,9 +74,21 @@ def _acao_for(path: str, origin):
 
 @app.middleware("http")
 async def cors_and_headers(request: Request, call_next):
+    global REQUEST_COUNT
     origin = request.headers.get("origin")
     path = request.url.path
+    request_id = str(uuid.uuid4())
     start = time.perf_counter()
+
+    # Q6: count every request to any endpoint (live counter)
+    REQUEST_COUNT += 1
+    # Q6: structured JSON log entry for every request
+    LOGS.append({
+        "level": "info",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "path": path,
+        "request_id": request_id,
+    })
 
     if request.method == "OPTIONS":
         # CORS preflight -- answer here
@@ -84,7 +106,7 @@ async def cors_and_headers(request: Request, call_next):
     resp.headers["Vary"] = "Origin"
 
     elapsed = time.perf_counter() - start
-    resp.headers["X-Request-ID"] = str(uuid.uuid4())
+    resp.headers["X-Request-ID"] = request_id
     resp.headers["X-Process-Time"] = f"{elapsed:.6f}"
     return resp
 
@@ -207,3 +229,35 @@ async def analytics(request: Request):
         "revenue": revenue,
         "top_user": top_user,
     }
+
+
+# --------------------------- Q6: observability -----------------------------
+@app.get("/work")
+async def work(n: int = Query(1)):
+    total = 0
+    for i in range(max(n, 0)):     # do K units of "work"
+        total += i
+    return {"email": EMAIL, "done": n}
+
+
+@app.get("/metrics")
+async def metrics():
+    text = (
+        "# HELP http_requests_total Total HTTP requests\n"
+        "# TYPE http_requests_total counter\n"
+        f"http_requests_total {REQUEST_COUNT}\n"
+    )
+    return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "uptime_s": time.time() - START_TIME}
+
+
+@app.get("/logs/tail")
+async def logs_tail(limit: int = Query(100)):
+    items = list(LOGS)
+    if limit > 0:
+        items = items[-limit:]
+    return items

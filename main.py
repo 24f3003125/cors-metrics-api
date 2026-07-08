@@ -58,6 +58,16 @@ REQUEST_COUNT = 0                 # live Prometheus counter
 LOGS = deque(maxlen=500)          # in-memory structured log buffer
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Q9 API-ENGINEERING STATE
+# ---------------------------------------------------------------------------
+T_ORDERS = 40                     # total orders in the fixed catalog (IDs 1..T)
+RATE_LIMIT = 15                   # R requests
+RATE_WINDOW = 10.0                # per 10 seconds
+IDEMPOTENT = {}                   # Idempotency-Key -> order
+RATE = {}                         # client_id -> deque[timestamps]
+# ---------------------------------------------------------------------------
+
 app = FastAPI()
 
 
@@ -98,7 +108,24 @@ async def cors_and_headers(request: Request, call_next):
             request.headers.get("access-control-request-headers") or "*"
         )
     else:
-        resp = await call_next(request)
+        # Q9: per-client rate limit on /orders (only when X-Client-Id present)
+        limited = None
+        if path.startswith("/orders"):
+            cid = request.headers.get("x-client-id")
+            if cid:
+                now = time.time()
+                dq = RATE.setdefault(cid, deque())
+                while dq and now - dq[0] >= RATE_WINDOW:
+                    dq.popleft()
+                if len(dq) >= RATE_LIMIT:
+                    retry = max(1, int(RATE_WINDOW - (now - dq[0])) + 1)
+                    limited = JSONResponse(
+                        status_code=429, content={"detail": "rate limit exceeded"}
+                    )
+                    limited.headers["Retry-After"] = str(retry)
+                else:
+                    dq.append(now)
+        resp = limited if limited is not None else await call_next(request)
 
     acao = _acao_for(path, origin)
     if acao:
@@ -261,3 +288,33 @@ async def logs_tail(limit: int = Query(100)):
     if limit > 0:
         items = items[-limit:]
     return items
+
+
+# --------------------------- Q9: orders API --------------------------------
+@app.post("/orders")
+async def create_order(request: Request):
+    key = request.headers.get("idempotency-key")
+    if key and key in IDEMPOTENT:
+        # repeat call with same key -> same order id, no duplicate
+        return JSONResponse(status_code=200, content=IDEMPOTENT[key])
+    order = {"id": str(uuid.uuid4()), "status": "created"}
+    if key:
+        IDEMPOTENT[key] = order
+    return JSONResponse(status_code=201, content=order)
+
+
+@app.get("/orders")
+async def list_orders(limit: int = Query(10), cursor: str = Query("")):
+    if limit < 1:
+        limit = 1
+    try:
+        start = int(cursor) if cursor else 1
+    except ValueError:
+        start = 1
+    if start < 1:
+        start = 1
+
+    end = min(start + limit - 1, T_ORDERS)
+    items = [{"id": i} for i in range(start, end + 1)]
+    next_cursor = str(end + 1) if end < T_ORDERS else None
+    return {"items": items, "next_cursor": next_cursor}
